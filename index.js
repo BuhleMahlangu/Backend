@@ -1,11 +1,15 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const itemsRoutes = require('./routes/items'); // Assuming you have items routes defined
+const itemsRoutes = require('./routes/items'); // Adjust based on your actual setup
 const oracledb = require('oracledb'); // Oracle DB driver
 const cors = require('cors'); // CORS for Cross-Origin Resource Sharing
 const bcrypt = require('bcrypt'); // To hash passwords
 const multer = require('multer');
 const path = require('path');
+const cloudinary = require('cloudinary').v2;
+const QRCode = require('qrcode'); // Import QR code library
+const nodemailer = require('nodemailer'); // Import Nodemailer for sending emails
+require('dotenv').config(); // Load environment variables
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -23,7 +27,30 @@ const storage = multer.diskStorage({
     }
 });
 
-const upload = multer({ storage: storage });
+const upload = multer({ 
+    storage: storage,
+    fileFilter: (req, file, cb) => {
+        // Accept only images
+        if (!file.mimetype.startsWith('image/')) {
+            return cb(new Error('Only image files are allowed!'), false);
+        }
+        cb(null, true);
+    }
+});
+
+// Configure Cloudinary
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+// Log configuration to verify
+console.log("Cloudinary Config:", {
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
 // Database connection configuration
 const dbConfig = {
@@ -46,23 +73,20 @@ app.get('/api/test-db-connection', async (req, res) => {
 });
 
 // Insert Event Function
-const insertEvent = async (title, description, eventDate, location, poster) => {
+const insertEvent = async (title, description, eventDate, location, poster, price) => {
     try {
         const connection = await oracledb.getConnection(dbConfig);
-
-        // Log the event date to verify its format
-        console.log("Event Date:", eventDate); // Should output in 'YYYY-MM-DD' format
         
-        // Ensure date format is compatible with TO_DATE
         const result = await connection.execute(
-            `INSERT INTO EVENTS (EVENT_ID, TITLE, DESCRIPTION, EVENT_DATE, LOCATION, CREATED_AT, POSTER) 
-             VALUES (event_id_seq.NEXTVAL, :title, :description, TO_DATE(:eventDate, 'YYYY-MM-DD'), :location, SYSTIMESTAMP, :poster)`,
+            `INSERT INTO EVENTS (EVENT_ID, TITLE, DESCRIPTION, EVENT_DATE, LOCATION, CREATED_AT, POSTER, PRICE, RSVP_COUNT) 
+             VALUES (event_id_seq.NEXTVAL, :title, :description, TO_DATE(:eventDate, 'YYYY-MM-DD'), :location, SYSTIMESTAMP, :poster, :price, 0)`,
             {
-                title: title,
-                description: description,
-                eventDate: eventDate, // Ensure it's 'YYYY-MM-DD'
-                location: location,
-                poster: poster
+                title,
+                description,
+                eventDate, // Ensure it's 'YYYY-MM-DD'
+                location,
+                poster,
+                price // New price parameter
             },
             { autoCommit: true }
         );
@@ -74,22 +98,24 @@ const insertEvent = async (title, description, eventDate, location, poster) => {
     }
 };
 
-// API endpoint for uploading event details
+// API endpoint for uploading event details and poster
 app.post('/api/admin/upload-event', upload.single('poster'), async (req, res) => {
-    const { title, description, location } = req.body; // Add title to body
+    const { title, description, location, eventDate, price } = req.body;
 
     // Ensure you have all required fields
-    if (!title || !description || !location || !req.file) {
+    if (!title || !description || !location || !eventDate || !price || !req.file) {
         return res.status(400).json({ error: 'All fields are required' });
     }
 
-    console.log('Event data received:', { title, description, location, poster: req.file.filename });
-
     try {
-        const eventId = await insertEvent(title, description, req.body.eventDate, location, req.file.filename); // Send correct eventDate here
-        res.status(201).json({ message: 'Event created successfully', eventId: eventId });
+        // Upload the image to Cloudinary
+        const result = await cloudinary.uploader.upload(req.file.path);
+        console.log("Image uploaded to Cloudinary:", result.secure_url);
+        
+        await insertEvent(title, description, eventDate, location, result.secure_url, price);
+        res.status(201).json({ message: 'Event created successfully' });
     } catch (err) {
-        console.error('Database error:', err);
+        console.error('Error uploading event:', err);
         res.status(500).json({ error: 'Error uploading event', details: err.message });
     }
 });
@@ -98,10 +124,9 @@ app.post('/api/admin/upload-event', upload.single('poster'), async (req, res) =>
 app.get('/api/events', async (req, res) => {
     try {
         const connection = await oracledb.getConnection(dbConfig);
-        const result = await connection.execute(`SELECT * FROM EVENTS ORDER BY CREATED_AT DESC`); // Order by creation date
+        const result = await connection.execute(`SELECT * FROM EVENTS ORDER BY CREATED_AT DESC`);
         await connection.close();
         
-        // Format the result as needed
         const events = result.rows.map(row => ({
             eventId: row[0],
             title: row[1],
@@ -109,7 +134,9 @@ app.get('/api/events', async (req, res) => {
             eventDate: row[3],
             location: row[4],
             createdAt: row[5],
-            poster: row[6]
+            poster: row[6], // URL of the poster
+            price: row[7], // Price of the event
+            rsvpCount: row[8] // RSVP count for the event
         }));
 
         res.status(200).json(events);
@@ -119,11 +146,88 @@ app.get('/api/events', async (req, res) => {
     }
 });
 
+// API endpoint for RSVPing to an event
+app.post('/api/events/:eventId/rsvp', async (req, res) => {
+    const eventId = req.params.eventId;
+
+    try {
+        const connection = await oracledb.getConnection(dbConfig);
+        
+        // Increment RSVP count for the event
+        await connection.execute(
+            `UPDATE EVENTS SET RSVP_COUNT = NVL(RSVP_COUNT, 0) + 1 WHERE EVENT_ID = :eventId`,
+            [eventId],
+            { autoCommit: true }
+        );
+
+        await connection.close();
+        res.status(200).json({ message: 'RSVP successful!', eventId });
+    } catch (err) {
+        console.error('RSVP error:', err);
+        res.status(500).json({ error: 'Error during RSVP', details: err.message });
+    }
+});
+
+// API endpoint for generating a QR code for an RSVP
+app.get('/api/events/:eventId/qrcode', async (req, res) => {
+    const eventId = req.params.eventId;
+    const ticketData = {
+        eventId: eventId,
+        message: 'Your RSVP is confirmed!',
+    };
+
+    try {
+        const qrCode = await QRCode.toDataURL(JSON.stringify(ticketData)); // Generates a QR code as a Data URL
+        res.status(200).json({ qrCode });
+    } catch (error) {
+        console.error('Error generating QR code:', error);
+        res.status(500).json({ error: 'Failed to generate QR Code', details: error.message });
+    }
+});
+
+// Payment endpoint
+app.post('/api/pay', async (req, res) => {
+    const { eventId, paymentData, email } = req.body;
+
+    // Here you would integrate with a payment gateway like Stripe
+    try {
+        // Payment processing logic goes here (using a payment service)
+        
+        // After payment is successful, send an email confirmation
+        const transporter = nodemailer.createTransport({
+            service: 'Gmail', // Example: Use Gmail, update accordingly
+            auth: {
+                user: process.env.EMAIL_USER,
+                pass: process.env.EMAIL_PASS,
+            },
+        });
+
+        const mailOptions = {
+            from: process.env.EMAIL_USER,
+            to: email,
+            subject: 'Payment Confirmation',
+            text: `Thank you for your payment for event ${eventId}!`,
+        };
+
+        await transporter.sendMail(mailOptions);
+        
+        // Generate the ticket with QR code included
+        const ticketData = {
+            eventId: eventId,
+            qrCode: await QRCode.toDataURL(`Event ID: ${eventId}`),
+            message: 'Your RSVP is confirmed!',
+        };
+
+        res.status(200).json({ ticket: ticketData });
+    } catch (error) {
+        console.error('Payment processing error:', error);
+        res.status(500).json({ error: 'Payment processing failed', details: error.message });
+    }
+});
+
 // API endpoint for registering a user
 app.post('/api/register', async (req, res) => {
     const { username, password, email } = req.body;
-
-    console.log('Registration data received:', { username, email });
 
     try {
         const connection = await oracledb.getConnection(dbConfig);
@@ -156,8 +260,6 @@ app.post('/api/register', async (req, res) => {
 // API endpoint for logging in a user
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
-
-    console.log('Login data received:', { username });
 
     try {
         const connection = await oracledb.getConnection(dbConfig);
@@ -225,8 +327,6 @@ app.post('/api/admin/login', async (req, res) => {
 app.post('/api/admin/register', async (req, res) => {
     const { username, password, email } = req.body;
 
-    console.log('Admin registration data received:', { username, email });
-
     try {
         const connection = await oracledb.getConnection(dbConfig);
         
@@ -252,6 +352,28 @@ app.post('/api/admin/register', async (req, res) => {
     } catch (err) {
         console.error('Database error:', err);
         res.status(500).json({ error: 'Error creating admin', details: err.message });
+    }
+});
+
+// API endpoint for deleting an event
+app.delete('/api/events/:eventId', async (req, res) => {
+    const eventId = req.params.eventId;
+
+    try {
+        const connection = await oracledb.getConnection(dbConfig);
+
+        // Execute the delete command
+        await connection.execute(
+            `DELETE FROM EVENTS WHERE EVENT_ID = :eventId`,
+            [eventId],
+            { autoCommit: true }
+        );
+
+        await connection.close();
+        res.status(200).json({ message: 'Event deleted successfully!' });
+    } catch (err) {
+        console.error('Delete event error:', err);
+        res.status(500).json({ error: 'Error deleting event', details: err.message });
     }
 });
 
