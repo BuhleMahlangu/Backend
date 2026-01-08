@@ -4,9 +4,9 @@ const itemsRoutes = require('./routes/items'); // Adjust based on your actual se
 const oracledb = require('oracledb'); // Oracle DB driver
 const cors = require('cors'); // CORS for Cross-Origin Resource Sharing
 const bcrypt = require('bcrypt'); // To hash passwords
-const multer = require('multer');
-const path = require('path');
-const cloudinary = require('cloudinary').v2;
+const multer = require('multer'); // Middleware for handling file uploads
+const path = require('path'); // For handling file paths
+const cloudinary = require('cloudinary').v2; // Cloudinary for image uploads
 const QRCode = require('qrcode'); // Import QR code library
 const nodemailer = require('nodemailer'); // Import Nodemailer for sending emails
 require('dotenv').config(); // Load environment variables
@@ -54,29 +54,103 @@ console.log("Cloudinary Config:", {
 
 // Database connection configuration
 const dbConfig = {
-    user: 'hr',                         
-    password: 'cmpg321',                
-    connectString: 'localhost:1521/XE'  
+    user: process.env.DB_USER || 'hr',
+    password: process.env.DB_PASSWORD || 'cmpg321',
+    connectString: process.env.DB_CONNECTION_STRING || 'localhost:1521/XE'
 };
 
 // Test database connection endpoint
 app.get('/api/test-db-connection', async (req, res) => {
+    let connection;
     try {
-        const connection = await oracledb.getConnection(dbConfig);
+        connection = await oracledb.getConnection(dbConfig);
         console.log('Database connected successfully');
-        await connection.close();
         res.status(200).json({ message: 'Database connection successful' });
     } catch (err) {
         console.error('Database connection error:', err);
         res.status(500).json({ error: 'Database connection failed', details: err.message });
+    } finally {
+        if (connection) {
+            try {
+                await connection.close();
+            } catch (closeErr) {
+                console.error('Error closing connection', closeErr);
+            }
+        }
+    }
+});
+
+// Fetch user information endpoint
+app.get('/api/user', async (req, res) => {
+    const userId = req.user?.id; // Retrieve user ID, ensure req.user exists
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    let connection;
+    try {
+        connection = await oracledb.getConnection(dbConfig);
+        const result = await connection.execute(`SELECT * FROM USERS WHERE USER_ID = :userId`, [userId]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        const user = {
+            id: result.rows[0][0],
+            username: result.rows[0][1],
+            email: result.rows[0][2],
+        };
+
+        res.status(200).json(user);
+    } catch (err) {
+        console.error('Error fetching user:', err);
+        res.status(500).json({ error: 'Internal Server Error', details: err.message });
+    } finally {
+        if (connection) {
+            try {
+                await connection.close();
+            } catch (closeErr) {
+                console.error('Error closing connection', closeErr);
+            }
+        }
+    }
+});
+
+// Fetch RSVPed events endpoint
+app.get('/api/rsvps', async (req, res) => {
+    const userId = req.user?.id; // Retrieve user ID
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    let connection;
+    try {
+        connection = await oracledb.getConnection(dbConfig);
+        const result = await connection.execute(`SELECT * FROM RSVPS WHERE USER_ID = :userId`, [userId]);
+
+        const rsvps = result.rows.map(row => ({
+            eventId: row[0],
+            title: row[1],
+            date: row[2],
+        }));
+
+        res.status(200).json(rsvps);
+    } catch (err) {
+        console.error('Error fetching RSVPs:', err);
+        res.status(500).json({ error: 'Internal Server Error', details: err.message });
+    } finally {
+        if (connection) {
+            try {
+                await connection.close();
+            } catch (closeErr) {
+                console.error('Error closing connection', closeErr);
+            }
+        }
     }
 });
 
 // Insert Event Function
 const insertEvent = async (title, description, eventDate, location, poster, price) => {
+    let connection;
     try {
-        const connection = await oracledb.getConnection(dbConfig);
-        
+        connection = await oracledb.getConnection(dbConfig);
         const result = await connection.execute(
             `INSERT INTO EVENTS (EVENT_ID, TITLE, DESCRIPTION, EVENT_DATE, LOCATION, CREATED_AT, POSTER, PRICE, RSVP_COUNT) 
              VALUES (event_id_seq.NEXTVAL, :title, :description, TO_DATE(:eventDate, 'YYYY-MM-DD'), :location, SYSTIMESTAMP, :poster, :price, 0)`,
@@ -90,11 +164,18 @@ const insertEvent = async (title, description, eventDate, location, poster, pric
             },
             { autoCommit: true }
         );
-        await connection.close();
         return result;
     } catch (err) {
         console.error('Insert Event Error:', err);
         throw new Error('Error inserting event: ' + err.message);
+    } finally {
+        if (connection) {
+            try {
+                await connection.close();
+            } catch (closeErr) {
+                console.error('Error closing connection', closeErr);
+            }
+        }
     }
 };
 
@@ -122,11 +203,11 @@ app.post('/api/admin/upload-event', upload.single('poster'), async (req, res) =>
 
 // API endpoint to get all events
 app.get('/api/events', async (req, res) => {
+    let connection;
     try {
-        const connection = await oracledb.getConnection(dbConfig);
+        connection = await oracledb.getConnection(dbConfig);
         const result = await connection.execute(`SELECT * FROM EVENTS ORDER BY CREATED_AT DESC`);
-        await connection.close();
-        
+
         const events = result.rows.map(row => ({
             eventId: row[0],
             title: row[1],
@@ -134,15 +215,23 @@ app.get('/api/events', async (req, res) => {
             eventDate: row[3],
             location: row[4],
             createdAt: row[5],
-            poster: row[6], // URL of the poster
-            price: row[7], // Price of the event
-            rsvpCount: row[8] // RSVP count for the event
+            poster: row[6],
+            price: row[7],
+            rsvpCount: row[8]
         }));
 
         res.status(200).json(events);
     } catch (err) {
         console.error('Error fetching events:', err);
         res.status(500).json({ error: 'Failed to fetch events', details: err.message });
+    } finally {
+        if (connection) {
+            try {
+                await connection.close();
+            } catch (closeErr) {
+                console.error('Error closing connection', closeErr);
+            }
+        }
     }
 });
 
@@ -150,8 +239,9 @@ app.get('/api/events', async (req, res) => {
 app.post('/api/events/:eventId/rsvp', async (req, res) => {
     const eventId = req.params.eventId;
 
+    let connection;
     try {
-        const connection = await oracledb.getConnection(dbConfig);
+        connection = await oracledb.getConnection(dbConfig);
         
         // Increment RSVP count for the event
         await connection.execute(
@@ -160,11 +250,18 @@ app.post('/api/events/:eventId/rsvp', async (req, res) => {
             { autoCommit: true }
         );
 
-        await connection.close();
         res.status(200).json({ message: 'RSVP successful!', eventId });
     } catch (err) {
         console.error('RSVP error:', err);
         res.status(500).json({ error: 'Error during RSVP', details: err.message });
+    } finally {
+        if (connection) {
+            try {
+                await connection.close();
+            } catch (closeErr) {
+                console.error('Error closing connection', closeErr);
+            }
+        }
     }
 });
 
@@ -189,12 +286,10 @@ app.get('/api/events/:eventId/qrcode', async (req, res) => {
 app.post('/api/pay', async (req, res) => {
     const { eventId, paymentData, email } = req.body;
 
-    // Here you would integrate with a payment gateway like Stripe
+    let transporter;
     try {
-        // Payment processing logic goes here (using a payment service)
-        
         // After payment is successful, send an email confirmation
-        const transporter = nodemailer.createTransport({
+        transporter = nodemailer.createTransport({
             service: 'Gmail', // Example: Use Gmail, update accordingly
             auth: {
                 user: process.env.EMAIL_USER,
@@ -229,8 +324,9 @@ app.post('/api/pay', async (req, res) => {
 app.post('/api/register', async (req, res) => {
     const { username, password, email } = req.body;
 
+    let connection;
     try {
-        const connection = await oracledb.getConnection(dbConfig);
+        connection = await oracledb.getConnection(dbConfig);
         
         const existingUser = await connection.execute(
             `SELECT * FROM USERS WHERE username = :username OR email = :email`,
@@ -250,10 +346,17 @@ app.post('/api/register', async (req, res) => {
         );
 
         res.status(201).json({ message: 'User created successfully', userId: result.lastRowId });
-        await connection.close();
     } catch (err) {
         console.error('Database error:', err);
         res.status(500).json({ error: 'Error creating user', details: err.message });
+    } finally {
+        if (connection) {
+            try {
+                await connection.close();
+            } catch (closeErr) {
+                console.error('Error closing connection', closeErr);
+            }
+        }
     }
 });
 
@@ -261,8 +364,9 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
 
+    let connection;
     try {
-        const connection = await oracledb.getConnection(dbConfig);
+        connection = await oracledb.getConnection(dbConfig);
         
         const result = await connection.execute(
             `SELECT * FROM USERS WHERE username = :username`,
@@ -282,13 +386,20 @@ app.post('/api/login', async (req, res) => {
 
         res.status(200).json({ 
             message: 'Login successful', 
-            user,
+            user: { id: user[0], username: user[1], email: user[3] }, 
             canSignUpAsAdmin: true // Indicate they can sign up as an admin
         });
-        await connection.close();
     } catch (err) {
-        console.error('Database error:', err); 
+        console.error('Database error:', err);
         res.status(500).json({ error: 'Login error', details: err.message });
+    } finally {
+        if (connection) {
+            try {
+                await connection.close();
+            } catch (closeErr) {
+                console.error('Error closing connection', closeErr);
+            }
+        }
     }
 });
 
@@ -296,8 +407,9 @@ app.post('/api/login', async (req, res) => {
 app.post('/api/admin/login', async (req, res) => {
     const { username, password } = req.body;
 
+    let connection;
     try {
-        const connection = await oracledb.getConnection(dbConfig);
+        connection = await oracledb.getConnection(dbConfig);
 
         const result = await connection.execute(
             `SELECT * FROM ADMIN WHERE USERNAME = :username`,
@@ -316,10 +428,17 @@ app.post('/api/admin/login', async (req, res) => {
         }
 
         res.status(200).json({ message: 'Admin login successful', admin: { id: admin[0], username: admin[1] } });
-        await connection.close();
     } catch (err) {
         console.error('Database error:', err); 
         res.status(500).json({ error: 'Login error', details: err.message });
+    } finally {
+        if (connection) {
+            try {
+                await connection.close();
+            } catch (closeErr) {
+                console.error('Error closing connection', closeErr);
+            }
+        }
     }
 });
 
@@ -327,8 +446,9 @@ app.post('/api/admin/login', async (req, res) => {
 app.post('/api/admin/register', async (req, res) => {
     const { username, password, email } = req.body;
 
+    let connection;
     try {
-        const connection = await oracledb.getConnection(dbConfig);
+        connection = await oracledb.getConnection(dbConfig);
         
         const existingAdmin = await connection.execute(
             `SELECT * FROM ADMIN WHERE USERNAME = :username OR EMAIL = :email`,
@@ -348,10 +468,17 @@ app.post('/api/admin/register', async (req, res) => {
         );
 
         res.status(201).json({ message: 'Admin created successfully', adminId: result.lastRowId });
-        await connection.close();
     } catch (err) {
         console.error('Database error:', err);
         res.status(500).json({ error: 'Error creating admin', details: err.message });
+    } finally {
+        if (connection) {
+            try {
+                await connection.close();
+            } catch (closeErr) {
+                console.error('Error closing connection', closeErr);
+            }
+        }
     }
 });
 
@@ -359,8 +486,9 @@ app.post('/api/admin/register', async (req, res) => {
 app.delete('/api/events/:eventId', async (req, res) => {
     const eventId = req.params.eventId;
 
+    let connection;
     try {
-        const connection = await oracledb.getConnection(dbConfig);
+        connection = await oracledb.getConnection(dbConfig);
 
         // Execute the delete command
         await connection.execute(
@@ -369,11 +497,18 @@ app.delete('/api/events/:eventId', async (req, res) => {
             { autoCommit: true }
         );
 
-        await connection.close();
         res.status(200).json({ message: 'Event deleted successfully!' });
     } catch (err) {
         console.error('Delete event error:', err);
         res.status(500).json({ error: 'Error deleting event', details: err.message });
+    } finally {
+        if (connection) {
+            try {
+                await connection.close();
+            } catch (closeErr) {
+                console.error('Error closing connection', closeErr);
+            }
+        }
     }
 });
 
